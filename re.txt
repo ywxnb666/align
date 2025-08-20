@@ -1,0 +1,21 @@
+bert-score==0.3.13
+bitsandbytes==0.42.0
+datasets==2.17.0
+huggingface-hub==0.20.3
+Jinja2==3.1.3
+Markdown==3.5.2
+matplotlib==3.8.3
+numpy==1.26.4
+openai==1.13.3
+pandas==2.2.0
+peft==0.8.2
+rouge==1.0.1
+scikit-learn==1.4.1.post1
+scipy==1.12.0
+tensorboard==2.16.2
+tokenizers==0.15.1
+torch==2.2.0
+tqdm==4.66.2
+transformers==4.38.1
+triton==2.2.0
+trl @ git+https://github.com/huggingface/trl@685209716915b010098b7e18b05fbad42af864d3
