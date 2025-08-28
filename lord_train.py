@@ -724,6 +724,7 @@ def main():
         "piqa",
         "truthful_qa",
         "allenai/ai2_arc",
+        "ceval/ceval-exam",
     ]
 
     tasks_code = [

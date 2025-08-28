@@ -75,7 +75,7 @@ from transformers import AutoModelForCausalLM, AutoTokenizer
 from transformers import BitsAndBytesConfig
 import torch
 
-model_path = "./qa_ckpts/MERGED/llama38b-LoRD-VI-truthful_qa/"
+model_path = "./qa_ckpts/MERGED/llama38b-kd-ceval/"
 # model_path = "./qa_ckpts/MERGED/llama38b-kd-truthful_qa/"
 #model_path = "./qa_ckpts/MERGED/llama38b-vanilla-truthful_qa/"
 
@@ -130,6 +130,15 @@ print("========================\n")
 
 print(f"🤖AI: Hello! I'm an AI assistant. Ask me any question you have!")
 
+import ftfy
+
+def fix_mojibake(text: str) -> str:
+    """
+    修复因编码混淆导致的UTF-8乱码（如Latin-1误解码）
+    支持多层编码错误修复（如 "ÃƒÂ" → "A"）
+    """
+    return ftfy.fix_text(text)
+
 while True:
     try:
         message = input("👤User: ")
@@ -141,13 +150,14 @@ while True:
             "【Mandatory Constraints】",  # Using "Mandatory" as in [3](@ref)'s "Mandatory clause"
             "1. Responses must not exceed 5 sentences",  # "Constraints" aligned with financial constraint terminology [1](@ref)
             "2. Output only core facts; explain the reasons in 3 sentences.",  # "Core facts" maintains precision requirement
-            "3. For multi-step reasoning questions, provide the final conclusion directly"  # "Directly" corresponds to operative constraint principle [2](@ref)
+            "3. For multi-step reasoning questions, provide the final conclusion directly",  # "Directly" corresponds to operative constraint principle [2](@ref)
+            "4. Answer the question by Chinese"
         ]
         constraint_instruction = "\n".join(constraint_rules)
         # ======================
         
         # 使用对话格式（根据模型训练格式调整）
-        formatted_input = f"### System: {constraint_instruction}\n### Human: Answer my question: {message}\n### Assistant:"
+        formatted_input = f"### System: {constraint_instruction}\n### Human: 回答我的问题: {message}\n### Assistant:"
         
         # Tokenize输入
         inputs = tokenizer(
@@ -182,8 +192,18 @@ while True:
         # 处理空响应
         if not response:
             response = "抱歉，我无法生成响应"
-        
-        print(f"🤖AI: {response}")
+
+        # res = ''
+        # for i in range(len(response)):
+        #     if response[i] == "\\":
+        #         byte_data = response[i:i+12].encode('latin1').decode('unicode_escape').encode('latin1')
+        #         decoded_text = byte_data.decode('utf-8')
+        #         res += decoded_text
+        #         i += 8
+        #     else:
+        #         res += response[i]
+        print(response)
+        print(f"🤖AI: {fix_mojibake(response)}")
         
     except KeyboardInterrupt:
         print("\n退出对话...")

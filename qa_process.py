@@ -45,6 +45,43 @@ from transformers import AutoModelForCausalLM,AutoTokenizer
 from peft import PeftModel
 import torch
 
+def safe_decode(text):
+    """修复模型输出中的编码问题"""
+    if isinstance(text, bytes):
+        try:
+            return text.decode("utf-8")
+        except UnicodeDecodeError:
+            try:
+                return text.decode("latin-1")
+            except UnicodeDecodeError:
+                return text.decode("utf-8", errors="ignore")
+    
+    # 处理字符串中的编码问题
+    if isinstance(text, str):
+        # 尝试直接返回，如果已经是正确编码
+        try:
+            # 检查是否包含典型的乱码模式
+            if '\\x' in text:
+                import re
+                # 匹配\xXX格式的转义序列
+                pattern = re.compile(r'\\x([0-9a-fA-F]{2})')
+                def replace_hex(match):
+                    return chr(int(match.group(1), 16))
+                text = pattern.sub(replace_hex, text)
+            
+            # 尝试编码再解码来修复
+            try:
+                return text.encode('latin-1').decode('utf-8')
+            except (UnicodeEncodeError, UnicodeDecodeError):
+                # 如果上述方法失败，尝试其他方法
+                try:
+                    return text.encode('utf-8').decode('utf-8')
+                except:
+                    return text
+        except:
+            return text
+    
+    return text
 
 def load_qa_datals(
     tokenizer,
@@ -58,7 +95,7 @@ def load_qa_datals(
     lm_tokenizer = tokenizer
 
     V = lm_tokenizer.vocab_size
-    tasks_we_used = ["piqa", "truthful_qa", "allenai/ai2_arc"]
+    tasks_we_used = ["piqa", "truthful_qa", "allenai/ai2_arc","ceval/ceval-exam"]
     assert task_name in tasks_we_used
     dataset_name = task_name
     inp_ls = []
@@ -121,6 +158,22 @@ def load_qa_datals(
             text = f"Question: {question}{choices_text}"
 
             inp_ls.append(text)
+            
+    elif task_name == tasks_we_used[3]:
+        trainset_text = load_dataset(
+            dataset_name, "accountant", split=f"test[:{train_num}]"
+        )
+
+        for item in trainset_text:
+            question = item["question"]
+            options = {"A": item["A"], "B": item["B"], "C": item["C"], "D": item["D"]}
+            answer = item["answer"]  # e.g. "C"
+            # 构造 prompt，格式与 ai2_arc 保持一致
+            text = question
+            for idx, key in enumerate(["A", "B", "C", "D"]):
+                text += f"\n\nSelection {idx+1}: {options[key]}"
+            label = str(["A", "B", "C", "D"].index(answer))
+            inp_ls.append(text)
 
     assert inp_ls != []
 
@@ -157,6 +210,7 @@ def infer_qa(modelname, task_name, res_pth, test_set_take_num=100,
         "piqa",
         "truthful_qa",
         "allenai/ai2_arc",
+        "ceval/ceval-exam",
     ]
 
     assert task_name in tasks_we_used
@@ -165,6 +219,7 @@ def infer_qa(modelname, task_name, res_pth, test_set_take_num=100,
         "piqa": 256,
         "truthful_qa": 256,
         "allenai/ai2_arc": 256,
+        "ceval/ceval-exam": 256,
     }
 
     print(task_name)
@@ -225,6 +280,21 @@ def infer_qa(modelname, task_name, res_pth, test_set_take_num=100,
             text = f"Question: {question}{choices_text}"
 
             inp_ls.append((text, label))
+            
+    elif task_name == tasks_we_used[3]:
+        trainset_text = load_dataset(
+            task_name, "accountant", split=f"val")
+
+        for item in trainset_text:
+            question = item["question"]
+            options = {"A": item["A"], "B": item["B"], "C": item["C"], "D": item["D"]}
+            answer = item["answer"]  # e.g. "C"
+            # 构造 prompt，格式与 ai2_arc 保持一致
+            text = question
+            for idx, key in enumerate(["A", "B", "C", "D"]):
+                text += f"\n\nSelection {idx+1}: {options[key]}"
+            label = str(["A", "B", "C", "D"].index(answer))
+            inp_ls.append((text,label))
 
     assert inp_ls != []
 
@@ -234,6 +304,7 @@ def infer_qa(modelname, task_name, res_pth, test_set_take_num=100,
         for d in tqdm(inp_ls):
             inps,summary = d
             res=chatWithOpenAI_APIs(modelname, pp, inps)
+            res = safe_decode(res) 
             print(f"Generated Text: {res}")
             res_ls.append((res, summary))
     elif modelname=="/mnt/petrelfs/share_data/ai4good_shared/models/meta-llama/llama3-8b-instruct":
@@ -272,6 +343,7 @@ def infer_qa(modelname, task_name, res_pth, test_set_take_num=100,
                 res = res.split(final_inps)[1]
             else:
                 res = res
+            res = safe_decode(res) 
             print(f"Text Generated:>>> {res}")
             res_ls.append((res, summary))
     elif base_model_name is None:
@@ -291,6 +363,7 @@ def infer_qa(modelname, task_name, res_pth, test_set_take_num=100,
                 0
             ]["generated_text"]
             res = res.split(final_inps)[1]
+            res = safe_decode(res) 
             print(f"Text Generated:>>> {res}")
             res_ls.append((res, summary))
     else:
@@ -330,6 +403,7 @@ def infer_qa(modelname, task_name, res_pth, test_set_take_num=100,
                 res = res.split(final_inps)[1]
             else:
                 res = res
+            res = safe_decode(res) 
             print(f"Text Generated:>>> {res}")
             res_ls.append((res, summary))
 
@@ -483,6 +557,7 @@ def eval_qa_res():
         ["piqa","./qa_ckpts/QAAAnewpiqa641LoRD-VI___period128/",],
         ["piqa","./qa_ckpts/QAAAnewpiqa641LoRD-VI___period256/",],
         ["piqa","./qa_ckpts/QAAAnewpiqa641LoRD-VI___period512/",],
+        
 
     )
 
@@ -815,6 +890,7 @@ def eval_varytrainum_res():
         # "piqa",
         "truthful_qa",
         "allenai/ai2_arc",
+        "ceval/ceval-exam",
     ]
     mls = [
         "LoRD-VI",
@@ -926,6 +1002,7 @@ def eval_varytrainum_231_ours():
         "piqa",
         "truthful_qa",
         "allenai/ai2_arc",
+        "ceval/ceval-exam",
     ]
     # taskls = [
     #     "piqa",
@@ -1026,6 +1103,12 @@ def eval_qaacc(task, res):
             "2": "Selection 3",
             "3": "Selection 4",
         },
+        "ceval/ceval-exam": {
+            "0": "Selection 1",
+            "1": "Selection 2",
+            "2": "Selection 3",
+            "3": "Selection 4",
+        },
     }
     extra_ai2 = {
         "0": "Selection A",
@@ -1055,6 +1138,16 @@ def eval_qaacc(task, res):
             "3": "2",
             "4": "3",
         },
+        "ceval/ceval-exam": {  
+        "A": "0",
+        "B": "1",
+        "C": "2",
+        "D": "3",
+        "0": "0",  
+        "1": "1",
+        "2": "2",
+        "3": "3",
+        },
     }
 
     predict_ls = []
@@ -1063,8 +1156,16 @@ def eval_qaacc(task, res):
     sm_r = {v: k for k, v in submap.items()}
     for res_sent, lbl in res:
         # print(res_sent)
+        res_sent = safe_decode(res_sent)
+        res_sent = res_sent.replace("<|eot_id|>", "")  # 移除特殊标记
+        res_sent = res_sent.strip()
+        
+        if task == "ceval/ceval-exam":
+            res_sent = res_sent.replace("\\xe", "")
+            res_sent = res_sent.replace("\\x", "")
+        
         res_sent = res_sent.lower()
-        if task == "allenai/ai2_arc":
+        if task == "allenai/ai2_arc" or task == "ceval/ceval-exam":
             # label_ls.append(float(sm_r[lbl]))
             if "1" in res_sent or "Selection A" in res_sent:
                 vv = sm_r["Selection 1"]
@@ -1103,6 +1204,7 @@ def eval_all_samles_in_dir(dirp="./vary_train_num_qa_infers"):
         "truthful_qa",
         # "allenai/ai2_arc",
         "allenai__ai2_arc",
+        "ceval/ceval-exam",
     ]
 
     import os

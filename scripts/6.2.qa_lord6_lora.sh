@@ -33,6 +33,7 @@ else
     echo "Using GPUs: $CUDA_VISIBLE_DEVICES"
 fi
 
+export PYTHONIOENCODING=utf-8
 export TORCH_USE_CUDA_DSA="1"
 export root_dir="/mnt/petrelfs/songxinhao/sxh/workspace3/align/"
 export POD_save_dir="${root_dir}qa_ckpts/"
@@ -44,11 +45,11 @@ export TRAIN_NUMS=(64)
 export train_times=(1 2 3 4 5)
 # export train_times=(1 2)
 export msl=256
-export task_ls=("truthful_qa" "allenai/ai2_arc")
+export task_ls=("ceval/ceval-exam" )
 # export task_ls=("truthful_qa" "allenai/ai2_arc")
 # export task_ls=("piqa")
-# export train_taskls=("kd")
-export train_taskls=("LoRD-VI")
+export train_taskls=("kd")
+# export train_taskls=("LoRD-VI")
 
 export is_black_box=1
 export use_lora=1

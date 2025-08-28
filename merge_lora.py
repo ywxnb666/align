@@ -40,11 +40,17 @@ import numpy as np
 def main():
     pretrained_p="/mnt/petrelfs/share_data/ai4good_shared/models/meta-llama/llama3-8b-instruct"
 
-    lora_p="./qa_ckpts/QAAAnewtruthful_qa645kd___finally"
-    save_p="./qa_ckpts/MERGED/llama38b-kd-truthful_qa"
+    #lora_p="./qa_ckpts/QAAAnewtruthful_qa645kd___finally"
+    #save_p="./qa_ckpts/MERGED/llama38b-kd-truthful_qa"
 
     # lora_p="./qa_ckpts/QAAAnewtruthful_qa645LoRD-VI___period512"
     # save_p="./qa_ckpts/MERGED/llama38b-LoRD-VI-truthful_qa"
+    
+    # lora_p="./qa_ckpts/QAAAnewceval/ceval-exam645LoRD-VI___period512"
+    # save_p="./qa_ckpts/MERGED/llama38b-LoRD-VI-ceval"
+    
+    lora_p="./qa_ckpts/QAAAnewceval/ceval-exam645kd___finally"
+    save_p="./qa_ckpts/MERGED/llama38b-kd-ceval"
 
     # lora_p="./wmt16_ckpts/WMTTT0519zh-en165LoRD-VI___period256"
     # save_p="./wmt16_ckpts/MERGED/llama38b-LoRD-VI-zh"
