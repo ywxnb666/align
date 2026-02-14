@@ -17,6 +17,7 @@ VQ-LoRD 主训练脚本
 ======================================================================
 """
 
+import gc
 import os
 import torch
 import argparse
@@ -32,6 +33,19 @@ from transformers import LlavaNextForConditionalGeneration, LlavaNextProcessor
 from transformers import BitsAndBytesConfig
 from peft import LoraConfig, get_peft_model, prepare_model_for_kbit_training
 
+# ==========================================
+# Monkey Patch: 修复 transformers 版本兼容性问题
+# 自动忽略旧版 config 中的 image_token 参数
+# ==========================================
+_original_init = LlavaNextProcessor.__init__
+
+def _new_init(self, *args, **kwargs):
+    kwargs.pop("image_token", None)  # 移除不支持的参数
+    _original_init(self, *args, **kwargs)
+
+LlavaNextProcessor.__init__ = _new_init
+# ==========================================
+
 from vq_module import VectorQuantizer, VQVisionEncoder
 from vision_lord_loss import VisionLoRDLoss, VisualQADistillationLoss
 from data_collector import GPT4VDataCollector, VQLORDDataset
@@ -44,7 +58,7 @@ def build_scienceqa_samples(
     train_num: int,
     seed: int,
 ) -> List[dict]:
-    dataset = load_dataset("derek-thomas/ScienceQA", split=split)
+    dataset = load_dataset("/root/autodl-tmp/datasets/ScienceQA", split=split)
     dataset_with_images = [item for item in dataset if item.get("image") is not None]
 
     import random
@@ -116,7 +130,20 @@ class ScienceQADataset(torch.utils.data.Dataset):
         image = item["image"]
         image_sizes_default = torch.tensor([image.height, image.width], dtype=torch.long)
 
-        full_text = f"{item['instruction']}\n{item['response']}"
+        instruction = item['instruction']
+        response = item['response']
+
+        # 预截断文本部分（不能截断 processor 输出，否则会破坏 <image> token 对齐）
+        # 先估算 response 的 token 数，超出预算则截断 response
+        max_text_tokens = self.max_length  # 纯文本 token 预算
+        instr_tokens = self.processor.tokenizer.encode(instruction, add_special_tokens=False)
+        resp_tokens = self.processor.tokenizer.encode(response, add_special_tokens=False)
+        budget = max_text_tokens - len(instr_tokens) - 2  # 留 2 给特殊 token
+        if budget > 0 and len(resp_tokens) > budget:
+            resp_tokens = resp_tokens[:budget]
+            response = self.processor.tokenizer.decode(resp_tokens, skip_special_tokens=True)
+
+        full_text = f"{instruction}\n{response}"
         inputs = self.processor(
             text=full_text,
             images=image,
@@ -189,8 +216,10 @@ def setup_args():
                        help="LoRD 置信度阈值")
     parser.add_argument("--tau_delta", type=float, default=0.01,
                        help="LoRD delta 阈值")
-    parser.add_argument("--max_new_tokens", type=int, default=64,
+    parser.add_argument("--max_new_tokens", type=int, default=128,
                        help="LoRD 生成最大新 token 数")
+    parser.add_argument("--grad_accum", type=int, default=4,
+                       help="梯度累积步数 (等效增大 batch size)")
     
     # LoRA 参数
     parser.add_argument("--use_lora", type=int, default=1,
@@ -342,7 +371,7 @@ def add_vq_to_model(model, args):
         
         # 保存 VQ 损失供训练使用
         model._vq_loss_container["loss"] = vq_loss
-        model._vq_loss_container["logits"] = logits
+        # model._vq_loss_container["logits"] = logits  # 节省显存，不保存未使用的 logits
         model._vq_loss_container["indices"] = indices
         
         # 返回量化后的特征（替换原始特征）
@@ -647,7 +676,9 @@ def train_stage3_lord(model, dataloader, args, tb_writer):
     tau_delta = getattr(args, 'tau_delta', 0.01)  # delta 阈值
     max_new_tokens = getattr(args, 'max_new_tokens', 64)  # 生成长度
     
-    print(f"LoRD 参数: tau1={tau1}, tau_delta={tau_delta}, max_new_tokens={max_new_tokens}")
+    grad_accum = getattr(args, 'grad_accum', 1)
+    
+    print(f"LoRD 参数: tau1={tau1}, tau_delta={tau_delta}, max_new_tokens={max_new_tokens}, grad_accum={grad_accum}")
     
     optimizer = torch.optim.AdamW(
         [p for p in model.parameters() if p.requires_grad],
@@ -657,14 +688,58 @@ def train_stage3_lord(model, dataloader, args, tb_writer):
     # 用于记录上一轮的 log prob (用于计算 delta)
     prev_log_probs = {}
     
+    # ========== 断点续训：加载已有的 Stage3 checkpoint ==========
     global_step = 0
-    for epoch in range(args.epochs):
+    start_epoch = 0
+    stage3_resume_dir = os.path.join(args.save_path, "stage3_resume")
+    stage3_state_path = os.path.join(stage3_resume_dir, "training_state.pt")
+    
+    if os.path.exists(stage3_state_path):
+        print(f"检测到 Stage3 断点，正在恢复: {stage3_state_path}")
+        state = torch.load(stage3_state_path, map_location=args.device)
+        start_epoch = state["epoch"]
+        global_step = state["global_step"]
+        prev_log_probs = state.get("prev_log_probs", {})
+        
+        # 加载模型权重（需要在 optimizer 之前加载）
+        resume_model_dir = os.path.join(stage3_resume_dir, "model")
+        if os.path.exists(resume_model_dir):
+            from safetensors.torch import load_file as safe_load
+            adapter_path = os.path.join(resume_model_dir, "adapter_model.safetensors")
+            if os.path.exists(adapter_path):
+                sd = safe_load(adapter_path, device=str(args.device))
+                model.load_state_dict(sd, strict=False)
+            else:
+                adapter_bin = os.path.join(resume_model_dir, "adapter_model.bin")
+                if os.path.exists(adapter_bin):
+                    sd = torch.load(adapter_bin, map_location=args.device)
+                    model.load_state_dict(sd, strict=False)
+        
+            # 加载 VQ codebook
+            vq_resume_path = os.path.join(resume_model_dir, "vq_codebook.pt")
+            if os.path.exists(vq_resume_path):
+                cb = torch.load(vq_resume_path, map_location="cpu")
+                model.vq_vision_encoder.vq.embedding.weight.data.copy_(cb)
+        
+        # 加载 optimizer state（加载到与参数一致的设备上）
+        optimizer.load_state_dict(state["optimizer_state_dict"])
+        
+        # 如果已经训练完成，跳过
+        if start_epoch >= args.epochs:
+            print(f"训练已完成 (epoch={start_epoch}/{args.epochs})，无需继续")
+            return model
+        
+        print(f"已恢复: epoch={start_epoch}, global_step={global_step}")
+    
+    for epoch in range(start_epoch, args.epochs):
         epoch_loss = 0.0
         epoch_obj_loss = 0.0
         epoch_reg_loss = 0.0
         epoch_vq_loss = 0.0
         
         for batch_idx, batch in enumerate(tqdm(dataloader, desc=f"LoRD Epoch {epoch+1}")):
+            if batch is None:
+                continue
             global_step += 1
             
             # 获取输入数据
@@ -675,6 +750,8 @@ def train_stage3_lord(model, dataloader, args, tb_writer):
             if image_sizes is not None:
                 image_sizes = image_sizes.to(args.device)
             labels = batch["labels"].to(args.device)  # y_vic
+            
+            torch.cuda.empty_cache()  # 清理缓存，防止 OOM
             
             bs = input_ids.shape[0]
             
@@ -817,97 +894,141 @@ def train_stage3_lord(model, dataloader, args, tb_writer):
                     y_plus_mask[i] = y_vic_mask[i]
                     log_prob_plus[i] = log_prob_vic[i]
             
-            # ========== Step 4: 计算 LoRD 损失 ==========
-            # 重新计算 y+, y- 的 log prob (需要梯度)
-            outputs_plus = model(
-                input_ids=y_plus_ids,
-                attention_mask=y_plus_mask,
-                pixel_values=pixel_values,
-                image_sizes=image_sizes,
-            )
-            logits_plus = outputs_plus.logits[:, :-1, :]
-            log_probs_plus = F.log_softmax(logits_plus, dim=-1)
-            token_lp_plus = log_probs_plus.gather(
-                dim=-1,
-                index=y_plus_ids[:, 1:].unsqueeze(-1)
-            ).squeeze(-1)
-            mask_plus = y_plus_mask[:, 1:].float()
-            seq_lp_plus = (token_lp_plus * mask_plus).sum(dim=-1) / mask_plus.sum(dim=-1).clamp(min=1)
+            # 清理 Step 2/3 产生的不再需要的中间张量
+            del log_prob_s1, log_prob_s2, log_prob_vic
+            del token_lp_s1, token_lp_s2, token_lp_vic
+            del mask_s1, mask_s2, mask_vic
+            del s1_ids, s2_ids, s1_mask, s2_mask
+            del log_prob_plus, log_prob_minus
+            torch.cuda.empty_cache()
+
+            # ========== Step 4: 计算 LoRD 损失 (梯度累积，避免 OOM) ==========
+            # 核心思路：不再同时持有 3 个计算图，而是逐个前向+backward，
+            # 利用梯度累积达到等价效果，峰值显存降为原来的 ~1/3。
             
-            outputs_minus = model(
-                input_ids=y_minus_ids,
-                attention_mask=y_minus_mask,
-                pixel_values=pixel_values,
-                image_sizes=image_sizes,
-            )
-            logits_minus = outputs_minus.logits[:, :-1, :]
-            log_probs_minus = F.log_softmax(logits_minus, dim=-1)
-            token_lp_minus = log_probs_minus.gather(
-                dim=-1,
-                index=y_minus_ids[:, 1:].unsqueeze(-1)
-            ).squeeze(-1)
-            mask_minus = y_minus_mask[:, 1:].float()
-            seq_lp_minus = (token_lp_minus * mask_minus).sum(dim=-1) / mask_minus.sum(dim=-1).clamp(min=1)
+            # 梯度累积：仅在累积周期开始时清零 (用 batch_idx 判断，避免跨 epoch 边界漏清零)
+            if batch_idx % grad_accum == 0:
+                optimizer.zero_grad(set_to_none=True)
             
-            outputs_vic = model(
-                input_ids=y_vic_ids,
-                attention_mask=y_vic_mask,
-                pixel_values=pixel_values,
-                image_sizes=image_sizes,
-            )
-            logits_vic = outputs_vic.logits[:, :-1, :]
-            log_probs_vic = F.log_softmax(logits_vic, dim=-1)
-            token_lp_vic_grad = log_probs_vic.gather(
-                dim=-1,
-                index=y_vic_ids[:, 1:].unsqueeze(-1)
-            ).squeeze(-1)
-            mask_vic_grad = y_vic_mask[:, 1:].float()
-            seq_lp_vic = (token_lp_vic_grad * mask_vic_grad).sum(dim=-1) / mask_vic_grad.sum(dim=-1).clamp(min=1)
+            # --- 辅助函数：单次前向计算序列 log prob (带梯度) ---
+            def _forward_seq_lp(ids, mask, pv=pixel_values, isz=image_sizes):
+                out = model(
+                    input_ids=ids,
+                    attention_mask=mask,
+                    pixel_values=pv,
+                    image_sizes=isz,
+                )
+                logits = out.logits[:, :-1, :]
+                lp = F.log_softmax(logits, dim=-1)
+                token_lp = lp.gather(dim=-1, index=ids[:, 1:].unsqueeze(-1)).squeeze(-1)
+                m = mask[:, 1:].float()
+                seq_lp = (token_lp * m).sum(dim=-1) / m.sum(dim=-1).clamp(min=1)
+                return seq_lp
             
-            # L_obj = -(log P(y+) - log P(y-))
-            # 目标：最大化 y+ 与 y- 的差距
-            L_obj = -torch.mean(seq_lp_plus - seq_lp_minus)
+            # --- (a) 先用 no_grad 计算 y- 的 detached log prob，供后续两步使用 ---
+            with torch.no_grad():
+                seq_lp_minus_detached = _forward_seq_lp(y_minus_ids, y_minus_mask).detach()
+            torch.cuda.empty_cache()
             
-            # L_reg = -clip(log P(y_vic) - log P(y-))
-            # 使用 y_vic 作为锚点
-            L_reg = -torch.mean(log_clip(seq_lp_vic - seq_lp_minus))
+            # --- (b) Forward y+，计算 L_obj 的 y+ 部分并 backward ---
+            seq_lp_plus = _forward_seq_lp(y_plus_ids, y_plus_mask)
+            # L_obj 中 y+ 的贡献: -mean(log P(y+))  (y- 部分被 detach)
+            L_obj_plus = -torch.mean(seq_lp_plus)
+            L_obj_plus.backward()
+            L_obj_plus_val = L_obj_plus.item()
+            del seq_lp_plus, L_obj_plus
+            torch.cuda.empty_cache()
             
-            # VQ 损失
-            vq_loss = model._vq_loss_container.get("loss", torch.tensor(0.0, device=args.device))
-            if vq_loss is None:
+            # --- (c) Forward y_vic，计算 L_reg 的 y_vic 部分并 backward ---
+            seq_lp_vic = _forward_seq_lp(y_vic_ids, y_vic_mask)
+            L_reg = -torch.mean(log_clip(seq_lp_vic - seq_lp_minus_detached))
+            L_reg.backward()
+            L_reg_val = L_reg.item()
+            del seq_lp_vic, L_reg
+            torch.cuda.empty_cache()
+            
+            # --- (d) Forward y-，计算 L_obj 的 y- 部分 + VQ loss 并 backward ---
+            seq_lp_minus = _forward_seq_lp(y_minus_ids, y_minus_mask)
+            # L_obj 中 y- 的贡献: +mean(log P(y-))  (与 y+ 的 -mean 合起来就是原式)
+            L_obj_minus = torch.mean(seq_lp_minus)
+            
+            vq_loss = model._vq_loss_container.get("loss", None)
+            if vq_loss is None or not isinstance(vq_loss, torch.Tensor):
                 vq_loss = torch.tensor(0.0, device=args.device)
             
-            # 总损失
-            total_loss = L_obj + L_reg + args.beta * vq_loss
+            partial_loss = L_obj_minus + args.beta * vq_loss
+            partial_loss.backward()
+            L_obj_minus_val = L_obj_minus.item()
+            vq_loss_val = vq_loss.item() if isinstance(vq_loss, torch.Tensor) else 0.0
+            del seq_lp_minus, L_obj_minus, partial_loss, vq_loss, seq_lp_minus_detached
+            torch.cuda.empty_cache()
             
-            optimizer.zero_grad()
-            total_loss.backward()
-            optimizer.step()
+            # --- (e) 梯度累积满后执行 optimizer step ---
+            if (batch_idx + 1) % grad_accum == 0 or batch_idx == len(dataloader) - 1:
+                optimizer.step()
+            
+            # 还原 L_obj 和 total 的值用于日志
+            L_obj_val = L_obj_plus_val + L_obj_minus_val
+            total_loss_val = L_obj_val + L_reg_val + args.beta * vq_loss_val
             
             # 记录损失
-            epoch_loss += total_loss.item()
-            epoch_obj_loss += L_obj.item()
-            epoch_reg_loss += L_reg.item()
-            if hasattr(vq_loss, 'item'):
-                epoch_vq_loss += vq_loss.item()
+            epoch_loss += total_loss_val
+            epoch_obj_loss += L_obj_val
+            epoch_reg_loss += L_reg_val
+            epoch_vq_loss += vq_loss_val
             
             if global_step % args.log_step == 0:
-                print(f"Step {global_step}, Total: {total_loss.item():.4f}, "
-                      f"L_obj: {L_obj.item():.4f}, L_reg: {L_reg.item():.4f}, "
-                      f"VQ: {vq_loss.item() if hasattr(vq_loss, 'item') else 0:.4f}")
-                tb_writer.add_scalar("stage3/total_loss", total_loss.item(), global_step)
-                tb_writer.add_scalar("stage3/L_obj", L_obj.item(), global_step)
-                tb_writer.add_scalar("stage3/L_reg", L_reg.item(), global_step)
-                tb_writer.add_scalar("stage3/vq_loss", vq_loss.item() if hasattr(vq_loss, 'item') else 0, global_step)
+                print(f"Step {global_step}, Total: {total_loss_val:.4f}, "
+                      f"L_obj: {L_obj_val:.4f}, L_reg: {L_reg_val:.4f}, "
+                      f"VQ: {vq_loss_val:.4f}")
+                tb_writer.add_scalar("stage3/total_loss", total_loss_val, global_step)
+                tb_writer.add_scalar("stage3/L_obj", L_obj_val, global_step)
+                tb_writer.add_scalar("stage3/L_reg", L_reg_val, global_step)
+                tb_writer.add_scalar("stage3/vq_loss", vq_loss_val, global_step)
             
             if global_step % args.save_step == 0:
                 save_checkpoint(model, args, f"step_{global_step}")
+            
+            # 主动清理显存，防止堆积
+            del gen_output_1, gen_output_2
+            del input_ids, attention_mask, pixel_values, image_sizes, labels
+            del y_plus_ids, y_minus_ids, y_plus_mask, y_minus_mask
+            del y_vic_ids, y_vic_mask
+            del prompt_ids, prompt_mask
+            del batch
+            gc.collect()
+            torch.cuda.empty_cache()
         
         # Epoch 统计
         num_batches = len(dataloader)
         print(f"Epoch {epoch+1} 平均损失: Total={epoch_loss/num_batches:.4f}, "
               f"L_obj={epoch_obj_loss/num_batches:.4f}, L_reg={epoch_reg_loss/num_batches:.4f}, "
               f"VQ={epoch_vq_loss/num_batches:.4f}")
+        
+        # ========== 每个 Epoch 结束保存断点 ==========
+        print(f"保存 Stage3 断点 (epoch={epoch+1}, step={global_step})...")
+        os.makedirs(stage3_resume_dir, exist_ok=True)
+        resume_model_dir = os.path.join(stage3_resume_dir, "model")
+        os.makedirs(resume_model_dir, exist_ok=True)
+        
+        # 保存模型权重
+        model.save_pretrained(resume_model_dir)
+        # 保存 VQ codebook
+        torch.save(
+            model.vq_vision_encoder.vq.embedding.weight.detach().cpu(),
+            os.path.join(resume_model_dir, "vq_codebook.pt")
+        )
+        # 保存训练状态
+        torch.save({
+            "epoch": epoch + 1,
+            "global_step": global_step,
+            "optimizer_state_dict": optimizer.state_dict(),
+            "prev_log_probs": prev_log_probs,
+        }, stage3_state_path)
+        print(f"断点已保存至 {stage3_resume_dir}")
+        
+        # 同时保存当前 epoch 的独立检查点
+        save_checkpoint(model, args, f"stage3_epoch{epoch+1}")
     
     return model
 
@@ -1069,6 +1190,7 @@ def main():
         if len(batch) == 0:
             return None
 
+        # --- 处理 image_sizes ---
         image_sizes_list = [b.get("image_sizes") for b in batch]
         for idx, size in enumerate(image_sizes_list):
             if size is None:
@@ -1077,6 +1199,50 @@ def main():
                     height = int(pixel_values.shape[-2])
                     width = int(pixel_values.shape[-1])
                     image_sizes_list[idx] = torch.tensor([height, width], dtype=torch.long)
+
+        # --- 对不等长的 1D 张量做 right-padding 对齐 ---
+        pad_token_id = processor.tokenizer.pad_token_id or 0
+        # 需要 pad 的 key 及其填充值
+        pad_keys = {
+            "input_ids": pad_token_id,
+            "attention_mask": 0,
+            "labels": -100,
+        }
+
+        # 先找出每个需要 pad 的 key 的最大长度
+        max_lens = {}
+        for key in pad_keys:
+            lengths = [b[key].shape[-1] for b in batch if key in b and isinstance(b[key], torch.Tensor)]
+            if lengths:
+                max_lens[key] = max(lengths)
+
+        # 对每个样本做 padding
+        for b in batch:
+            for key, pad_val in pad_keys.items():
+                if key not in b or not isinstance(b[key], torch.Tensor):
+                    continue
+                t = b[key]
+                target_len = max_lens.get(key, t.shape[-1])
+                if t.shape[-1] < target_len:
+                    pad_size = target_len - t.shape[-1]
+                    b[key] = F.pad(t, (0, pad_size), value=pad_val)
+
+        # pixel_values 可能形状不同（不同 patch 数），也需要对齐
+        pv_list = [b.get("pixel_values") for b in batch]
+        if all(isinstance(pv, torch.Tensor) for pv in pv_list):
+            pv_shapes = [pv.shape for pv in pv_list]
+            if len(set(pv_shapes)) > 1:
+                # patch 数不同，pad 第 0 维到最大值
+                max_patches = max(s[0] for s in pv_shapes)
+                for i, pv in enumerate(pv_list):
+                    if pv.shape[0] < max_patches:
+                        pad_tensor = torch.zeros(
+                            (max_patches - pv.shape[0],) + pv.shape[1:],
+                            dtype=pv.dtype, device=pv.device,
+                        )
+                        batch[i]["pixel_values"] = torch.cat([pv, pad_tensor], dim=0)
+
+        # --- 组装 collated dict ---
         base = []
         for b in batch:
             item = dict(b)

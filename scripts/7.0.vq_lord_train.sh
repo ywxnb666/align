@@ -22,7 +22,7 @@ export BNB_CUDA_VERSION=121
 export HF_ENDPOINT="https://hf-mirror.com"
 
 echo "HOME: ${HOME}"
-export python=${HOME}/anaconda3/envs/align_v/bin/python3
+export python=${HOME}/autodl-tmp/conda/envs/align_vq/bin/python3
 
 # 自动选择空闲 GPU
 export CUDA_VISIBLE_DEVICES=$(nvidia-smi --query-gpu=index,memory.used,utilization.gpu \
@@ -42,12 +42,12 @@ export TORCH_USE_CUDA_DSA="1"
 export PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True
 
 # 项目路径
-export root_dir="/root/workspace/align_vq/"
+export root_dir="/root/workspace/align/"
 export save_dir="${root_dir}vq_lord_ckpts/"
 export data_dir="${root_dir}vq_lord_data/"
 
 # 模型路径
-export model_path="/root/workspace/models/llama3-llava-next-8b-hf"
+export model_path="/root/autodl-tmp/models/llama3-llava-next-8b-hf"
 export victim_model="gpt-4-vision-preview"
 
 # ================== VQ-LoRD 参数配置 ==================
@@ -62,23 +62,25 @@ export alpha=1.0                # 视觉蒸馏损失权重
 export beta=0.25                # VQ 损失权重
 export temperature=1.5          # 蒸馏温度
 
-# 训练参数
+# 训练参数 (针对 A800 80GB PCIe 优化)
 export stage=3                  # 训练阶段 (1=VQ预训练, 2=视觉蒸馏, 3=全部)
 export epochs=3                 # 训练轮数
-export batch_size=1             # 批次大小 (多模态通常为1)
-export lr=3e-5                  # 学习率
-export max_length=512           # 最大序列长度
+export batch_size=1             # 批次大小 (LLaVA-Next 不支持 bs>1, 不同图片 patch 数不同)
+export grad_accum=8             # 梯度累积步数 (等效batch_size=8)
+export lr=2e-5                  # 学习率 (等效bs更大,lr适当降低)
+export max_length=1024          # 最大序列长度 (80GB充分利用长上下文)
+export max_new_tokens=256       # LoRD生成最大token数 (更完整的回复用于对比)
 
 # LoRA 参数
 export use_lora=1               # 使用 LoRA
-export lora_rank=32             # LoRA rank
-export lora_alpha_val=64        # LoRA alpha
+export lora_rank=64             # LoRA rank (80GB可支持更大rank,提升拟合能力)
+export lora_alpha_val=128       # LoRA alpha (通常为rank的2倍)
 
 # 量化
 export use_4bit=1               # 使用 4-bit 量化
 
 # 数据
-export train_num=500            # 训练样本数
+export train_num=500           # 训练样本数 (更多数据充分利用算力)
 export dataset_name="scienceqa" # 使用 ScienceQA 数据集
 export scienceqa_split="train"  # ScienceQA split
 export scienceqa_eval_split="validation"  # ScienceQA 验证/测试 split
@@ -123,6 +125,8 @@ $python ${root_dir}vq_lord/train_vq_lord.py \
     --lora_rank=$lora_rank \
     --lora_alpha=$lora_alpha_val \
     --use_4bit=$use_4bit \
+    --grad_accum=$grad_accum \
+    --max_new_tokens=$max_new_tokens \
     --data_dir=$data_dir \
     --train_num=$train_num \
     --dataset_name=$dataset_name \
